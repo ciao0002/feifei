@@ -1,0 +1,101 @@
+项目整体代码导读
+1) 逻辑流向梳理（入口脚本 → pipeline → generator → construct_sample → trainer → evaluate）
+
+A. 入口脚本 run_*.py（以 run_colight.py 为例）
+
+负责：解析参数、组装 dic_agent_conf / dic_traffic_env_conf / dic_path，然后调用 utils.utils.pipeline_wrapper()。
+
+典型状态/奖励配置（CoLight）：
+
+LIST_STATE_FEATURE = ["cur_phase","lane_num_vehicle","adjacency_matrix"]
+
+DIC_REWARD_INFO = {"queue_length": -0.25}（奖励由样本构造阶段根据 log 计算）
+
+B. 主控流程 utils/pipeline.py::Pipeline.run()（按 round 循环）
+每个 cnt_round 的固定顺序：
+
+数据生成：Generator.generate()（可多进程）
+
+样本构造：ConstructSample.make_reward_for_system()（读 log → 生成样本 pkl）
+
+网络训练/更新：Updater.load_sample_for_agents() + Updater.update_network_for_agents()
+
+测试评估：utils/model_test.py::test()（载入模型跑 test_round，写 test log）
+
+2) 核心模块总结（Markdown 表格）
+文件名	模块职责	与 CoLight 的关系
+run_colight.py / run_efficient_colight.py / run_advanced_colight.py	配置入口：state、reward、轮数、路网参数、路径等；调用 pipeline	参数配置入口（决定 CoLight 用哪些 state 特征、奖励权重、TOP_K_ADJACENCY 等）
+utils/utils.py	pipeline_wrapper() 封装，实例化 Pipeline 并 run()	调度入口
+utils/pipeline.py	round 主循环：generator → construct_sample → updater → test	总控流程（你改算法尽量不动这里）
+utils/generator.py	与环境交互产生轨迹 log；调用 agent choose_action()；最后 env.bulk_log_multi_process()	数据提供（RL 交互循环在这里）
+utils/cityflow_env.py	CityFlow 环境封装；Intersection 特征构造；日志落盘；邻接提取	状态/邻接来源（adjacency_matrix 构造、state 字段定义都在这里）
+utils/construct_sample.py	读取每个 intersection 的 inter_*.pkl log，构造训练样本 [s,a,s’,r_avg,r_inst,time,tag] 并 dump	训练样本构造（reward shaping 的关键落点）
+utils/updater.py	读样本、截断 memory、采样 batch，调用 agent prepare_Xs_Y()、train_network()、save_network()	训练调度（CoLight 的 TD target 在 agent 内构造）
+models/colight_agent.py	CoLight 算法实现：attention 图结构 Q 网络；prepare_Xs_Y() TD target；choose_action()	算法核心（你做多目标改进主要改这里 + 构造样本/奖励）
+utils/model_test.py	测试评估：载入模型，跑一遍 env.step，写 test log	evaluate（性能指标来自 test 日志）
+models/fixedtime_agent.py	固定时制 baseline（无学习）	非学习 baseline
+models/maxpressure_agent.py / models/efficient_maxpressure_agent.py / models/advanced_maxpressure_agent.py	MaxPressure 系列 baseline（基于压力规则，无学习/或轻量策略）	非学习 baseline（用于对比）
+models/mplight_agent.py / models/advanced_mplight_agent.py	MPLight 系列（学习型）	学习 baseline（对比 CoLight）
+models/presslight_one.py / models/simple_dqn_one.py	DQN/PressLight 类学习 baseline	学习 baseline（对比 CoLight）
+3) 关键路径识别
+3.1 强化学习交互循环（Agent ↔ Env）具体位置
+
+在 utils/generator.py::Generator.generate() 的 while 循环内：
+
+state = self.env.reset()
+
+每个 step：
+
+action = self.agents[i].choose_action(step_num, one_state)
+
+next_state, reward, done, _ = self.env.step(action_list)
+
+state = next_state
+
+同样的交互结构也出现在 utils/model_test.py::test()（测试阶段）。
+
+3.2 日志 (log) 与训练样本 (sample) 的生成与读取路径
+
+训练阶段 log：
+
+生成位置：Generator.__init__
+
+self.path_to_log = records/.../train_round/round_{cnt_round}/generator_{cnt_gen}
+
+落盘位置：CityFlowEnv.batch_log()（被 bulk_log_multi_process() 调用）
+
+vehicle_inter_{i}.csv
+
+inter_{i}.pkl（构造样本的核心输入）
+
+训练样本 pkl：
+
+读取 log：utils/construct_sample.py::ConstructSample.load_data(folder,i) 读 .../generator_x/inter_{i}.pkl
+
+写样本：ConstructSample.dump_sample()
+
+records/.../train_round/total_samples_inter_{i}.pkl（Updater 训练时读取）
+
+训练读样本：
+
+utils/updater.py::Updater.load_sample_with_forget(i) 读 total_samples_inter_{i}.pkl
+
+对 CoLight 特殊处理：Updater.load_sample_for_agents()
+
+若 MODEL_NAME in ["EfficientColight","AdvancedColight"]：将所有路口样本组成 samples_list，再 self.agents[0].prepare_Xs_Y(samples_list)（中心化训练输入）
+
+3.3 哪些是算法模块，哪些是非学习 Baseline
+
+算法模块（学习型）：
+
+models/colight_agent.py（CoLight）
+
+models/mplight_agent.py / models/advanced_mplight_agent.py
+
+models/presslight_one.py / models/simple_dqn_one.py
+
+非学习 Baseline（规则/固定）：
+
+models/fixedtime_agent.py（FixedTime）
+
+models/maxpressure_agent.py + efficient/advanced 版本（MaxPressure 系列）
