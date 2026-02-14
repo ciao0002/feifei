@@ -53,7 +53,8 @@ class Generator:
 
                 if self.dic_traffic_env_conf["MODEL_NAME"] in ["EfficientPressLight", "EfficientColight",
                                                                "EfficientMPLight", "Attend",
-                                                               "AdvancedMPLight", "AdvancedColight", "AdvancedDQN"]:
+                                                               "AdvancedMPLight", "AdvancedColight", "AdvancedDQN",
+                                                               "MHQCoSLight"]:
                     one_state = state
                     action = self.agents[i].choose_action(step_num, one_state)
                     action_list = action

@@ -8,6 +8,7 @@ from models.advanced_mplight_agent import AdvancedMPLightAgent
 from models.advanced_maxpressure_agent import AdvancedMaxPressureAgent
 from models.simple_dqn_one import SimpleDQNAgentOne
 from models.attendlight_agent import AttendLightAgent
+from models.mhq_coslight_agent import MHQCoSLightAgent
 
 DIC_AGENTS = {
     "Fixedtime": FixedtimeAgent,
@@ -22,7 +23,9 @@ DIC_AGENTS = {
     "AdvancedMPLight": AdvancedMPLightAgent,
     "AdvancedColight": CoLightAgent,
     "AdvancedDQN": SimpleDQNAgentOne,
-    "Attend": AttendLightAgent
+    "Attend": AttendLightAgent,
+    # Multi-head Q + CoSLight (optionally with Transformer encoder)
+    "MHQCoSLight": MHQCoSLightAgent,
 }
 
 DIC_PATH = {
@@ -37,9 +40,11 @@ dic_traffic_env_conf = {
 
     "LIST_MODEL": ["Fixedtime",  "MaxPressure", "EfficientMaxPressure", "AdvancedMaxPressure",
                    "EfficientPressLight", "EfficientColight", "EfficientMPLight",
-                   "AdvancedMPLight", "AdvancedColight", "AdvancedDQN", "Attend"],
+                   "AdvancedMPLight", "AdvancedColight", "AdvancedDQN", "Attend",
+                   "MHQCoSLight"],
     "LIST_MODEL_NEED_TO_UPDATE": ["EfficientPressLight", "EfficientColight", "EfficientMPLight",
-                                  "AdvancedMPLight", "AdvancedColight", "AdvancedDQN", "Attend"],
+                                  "AdvancedMPLight", "AdvancedColight", "AdvancedDQN", "Attend",
+                                  "MHQCoSLight"],
 
     "NUM_LANE": 12,
     "PHASE_MAP": [[1, 4, 12, 13, 14, 15, 16, 17], [7, 10, 18, 19, 20, 21, 22, 23], [0, 3, 18, 19, 20, 21, 22, 23], [6, 9, 12, 13, 14, 15, 16, 17]],
