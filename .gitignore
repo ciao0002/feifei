@@ -1,0 +1,29 @@
+# Advanced_XLight: keep repo lightweight and reproducible (code + data), ignore artifacts.
+
+# Experiments / outputs
+records/
+model/
+logs/
+summary/
+errors/
+
+# Large vendored research repos (not required for mhq_coslight runner)
+CoSLight/
+LibSignal/
+
+# Caches / temp
+__pycache__/
+**/__pycache__/
+.tmp/
+.agent/
+.pid
+
+# OS / editor
+.DS_Store
+
+# Logs / pids / archives / binaries
+*.log
+*.pid
+*.tar.gz
+codex-*
+
