@@ -1,5 +1,5 @@
 from .config import DIC_AGENTS
-from .cityflow_env import CityFlowEnv
+from .env_factory import get_env_class
 from .pipeline import path_check, copy_cityflow_file, copy_conf_file
 import os
 import time
@@ -30,7 +30,8 @@ class OneLine:
                 intersection_id=str(i)
             )
             self.agents.append(agent)
-        self.env = CityFlowEnv(
+        env_class = get_env_class(self.dic_traffic_env_conf)
+        self.env = env_class(
             path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
             path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
             dic_traffic_env_conf=self.dic_traffic_env_conf

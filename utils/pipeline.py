@@ -1,7 +1,4 @@
-from .generator import Generator
-from .construct_sample import ConstructSample
-from .updater import Updater
-from . import model_test
+from .env_factory import is_sumo
 import json
 import shutil
 import os
@@ -30,6 +27,8 @@ def copy_conf_file(dic_path, dic_agent_conf, dic_traffic_env_conf, path=None):
 
 
 def copy_cityflow_file(dic_path, dic_traffic_env_conf, path=None):
+    if is_sumo(dic_traffic_env_conf):
+        return
     if path is None:
         path = dic_path["PATH_TO_WORK_DIRECTORY"]
     shutil.copy(os.path.join(dic_path["PATH_TO_DATA"], dic_traffic_env_conf["TRAFFIC_FILE"]),
@@ -39,6 +38,11 @@ def copy_cityflow_file(dic_path, dic_traffic_env_conf, path=None):
 
 
 def generator_wrapper(cnt_round, cnt_gen, dic_path, dic_agent_conf, dic_traffic_env_conf):
+    if dic_traffic_env_conf.get("GENERATOR_CPU_ONLY", False):
+        # Keep sampling workers on CPU; reserve GPU context for model update/test.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
+    from .generator import Generator
     generator = Generator(cnt_round=cnt_round,
                           cnt_gen=cnt_gen,
                           dic_path=dic_path,
@@ -52,7 +56,7 @@ def generator_wrapper(cnt_round, cnt_gen, dic_path, dic_agent_conf, dic_traffic_
 
 
 def updater_wrapper(cnt_round, dic_agent_conf, dic_traffic_env_conf, dic_path):
-
+    from .updater import Updater
     updater = Updater(
         cnt_round=cnt_round,
         dic_agent_conf=dic_agent_conf,
@@ -81,9 +85,13 @@ class Pipeline:
         copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
 
     def run(self, multi_process=False):
-        f_time = open(os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "running_time.csv"), "w")
-        f_time.write("generator_time\tmaking_samples_time\tupdate_network_time\ttest_evaluation_times\tall_times\n")
-        f_time.close()
+        running_time_path = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "running_time.csv")
+        if not (self.dic_traffic_env_conf.get("RESUME", False) and os.path.exists(running_time_path)):
+            with open(running_time_path, "w") as f_time:
+                f_time.write(
+                    "generator_time\tmaking_samples_time\tupdate_network_time\t"
+                    "test_evaluation_times\tall_times\n"
+                )
         for cnt_round in range(self.dic_traffic_env_conf["NUM_ROUNDS"]):
             if self.dic_traffic_env_conf.get("RESUME", False):
                 # Check if round is already completed
@@ -132,6 +140,7 @@ class Pipeline:
             train_round = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "train_round")
             if not os.path.exists(train_round):
                 os.makedirs(train_round)
+            from .construct_sample import ConstructSample
             cs = ConstructSample(path_to_samples=train_round, cnt_round=cnt_round,
                                  dic_traffic_env_conf=self.dic_traffic_env_conf)
             cs.make_reward_for_system()
@@ -141,7 +150,7 @@ class Pipeline:
             print("==============  update network =============")
             update_network_start_time = time.time()
             if self.dic_traffic_env_conf["MODEL_NAME"] in self.dic_traffic_env_conf["LIST_MODEL_NEED_TO_UPDATE"]:
-                if multi_process:
+                if multi_process and self.dic_traffic_env_conf.get("MULTIPROCESS_UPDATER", True):
                     p = Process(target=updater_wrapper,
                                 args=(cnt_round,
                                       self.dic_agent_conf,
@@ -162,6 +171,7 @@ class Pipeline:
 
             print("==============  test evaluation =============")
             test_evaluation_start_time = time.time()
+            from . import model_test
             model_test.test(self.dic_path["PATH_TO_MODEL"], cnt_round,
                             self.dic_traffic_env_conf["RUN_COUNTS"], self.dic_traffic_env_conf)
 

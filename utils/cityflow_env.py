@@ -148,12 +148,15 @@ class Intersection:
         self.dic_lane_vehicle_current_step = {}
         self.dic_lane_vehicle_current_step_in = {}
         self.dic_lane_waiting_vehicle_count_current_step = {}
+        lane_vehicles = simulator_state["get_lane_vehicles"]
+        lane_waiting = simulator_state["get_lane_waiting_vehicle_count"]
         for lane in self.list_entering_lanes:
-            self.dic_lane_vehicle_current_step_in[lane] = simulator_state["get_lane_vehicles"][lane]
+            # Some maps (e.g., 1x1 samples) may not expose every expected lane index.
+            self.dic_lane_vehicle_current_step_in[lane] = lane_vehicles.get(lane, [])
 
         for lane in self.list_lanes:
-            self.dic_lane_vehicle_current_step[lane] = simulator_state["get_lane_vehicles"][lane]
-            self.dic_lane_waiting_vehicle_count_current_step[lane] = simulator_state["get_lane_waiting_vehicle_count"][lane]
+            self.dic_lane_vehicle_current_step[lane] = lane_vehicles.get(lane, [])
+            self.dic_lane_waiting_vehicle_count_current_step[lane] = lane_waiting.get(lane, 0)
 
         self.dic_vehicle_speed_current_step = simulator_state["get_vehicle_speed"]
         self.dic_vehicle_distance_current_step = simulator_state["get_vehicle_distance"]
@@ -186,8 +189,8 @@ class Intersection:
             last_step_vehicle_id_list = []
             current_step_vehilce_id_list = []
             for lane in self.list_entering_lanes:
-                last_step_vehicle_id_list.extend(self.dic_lane_vehicle_previous_step[lane])
-                current_step_vehilce_id_list.extend(self.dic_lane_vehicle_current_step[lane])
+                last_step_vehicle_id_list.extend(self.dic_lane_vehicle_previous_step.get(lane, []))
+                current_step_vehilce_id_list.extend(self.dic_lane_vehicle_current_step.get(lane, []))
 
             list_entering_lane_vehicle_left.append(
                 list(set(last_step_vehicle_id_list) - set(current_step_vehilce_id_list))
@@ -233,6 +236,10 @@ class Intersection:
         dic_feature = dict()
         dic_feature["cur_phase"] = [self.current_phase_index]
         dic_feature["time_this_phase"] = [self.current_phase_duration]
+
+        # Lightweight additions (optional): phase elapsed + downstream congestion indicator
+        if "phase_elapsed" in used_features:
+            dic_feature["phase_elapsed"] = [float(self.current_phase_duration)]
         
         # Base features needed by many others
         if "lane_num_vehicle" in used_features or "traffic_movement_pressure_num" in used_features:
@@ -244,6 +251,13 @@ class Intersection:
             dic_feature["lane_num_waiting_vehicle_in"] = self._get_lane_queue_length(self.list_entering_lanes)
         if "lane_num_waiting_vehicle_out" in used_features:
             dic_feature["lane_num_waiting_vehicle_out"] = self._get_lane_queue_length(self.list_exiting_lanes)
+
+        if "downstream_congestion" in used_features:
+            out_q = dic_feature.get("lane_num_waiting_vehicle_out") or self._get_lane_queue_length(self.list_exiting_lanes)
+            try:
+                dic_feature["downstream_congestion"] = [float(np.mean(out_q))]
+            except Exception:
+                dic_feature["downstream_congestion"] = [0.0]
 
         # Advanced features - ONLY compute if requested
         if "traffic_movement_pressure_queue_efficient" in used_features:

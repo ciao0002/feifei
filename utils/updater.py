@@ -94,12 +94,39 @@ class Updater:
                 samples_list.append(sample_set)
             self.agents[0].prepare_Xs_Y(samples_list)
 
-    def update_network(self, i):
+    def update_network(self, i, save=True):
         print('update agent %d' % i)
         self.agents[i].train_network()
-        self.agents[i].save_network("round_{0}_inter_{1}".format(self.cnt_round, self.agents[i].intersection_id))
+        if save:
+            self.agents[i].save_network("round_{0}_inter_{1}".format(self.cnt_round, self.agents[i].intersection_id))
+
+    def save_network_for_agents(self):
+        for i in range(self.dic_traffic_env_conf['NUM_AGENTS']):
+            self.agents[i].save_network("round_{0}_inter_{1}".format(self.cnt_round, self.agents[i].intersection_id))
 
     def update_network_for_agents(self):
         print("update_network_for_agents", self.dic_traffic_env_conf['NUM_AGENTS'])
-        for i in range(self.dic_traffic_env_conf['NUM_AGENTS']):
-            self.update_network(i)
+        use_redq = (
+            self.dic_traffic_env_conf.get("MODEL_NAME") == "MHQCoSLight"
+            and bool(self.dic_agent_conf.get("USE_REDQ", False))
+        )
+        utd_ratio = max(1, int(self.dic_agent_conf.get("REDQ_UTD", 1))) if use_redq else 1
+        paper_utd = bool(self.dic_agent_conf.get("REDQ_PAPER_UTD", False)) if use_redq else False
+        if use_redq:
+            print("REDQ update loop enabled, UTD={}, paper_utd={}".format(utd_ratio, paper_utd))
+
+        for utd_step in range(utd_ratio):
+            if paper_utd:
+                print("REDQ UTD step {}/{}: paper-style resample".format(utd_step + 1, utd_ratio))
+                # Paper-style UTD: sample replay for every UTD update, including the first one.
+                self.sample_indexes = None
+                self.load_sample_for_agents()
+            elif utd_step > 0:
+                print("REDQ UTD step {}/{}: reload samples".format(utd_step + 1, utd_ratio))
+                # Legacy behavior: first step uses preloaded sample; later steps resample.
+                self.sample_indexes = None
+                self.load_sample_for_agents()
+            for i in range(self.dic_traffic_env_conf['NUM_AGENTS']):
+                self.update_network(i, save=False)
+
+        self.save_network_for_agents()

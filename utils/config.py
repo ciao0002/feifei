@@ -54,6 +54,7 @@ dic_traffic_env_conf = {
     "RUN_COUNTS": 3600,
     "MODEL_NAME": None,
     "TOP_K_ADJACENCY": 5,
+    "SIMULATOR": "cityflow",
 
     "ACTION_PATTERN": "set",
     "NUM_INTERSECTIONS": 1,
@@ -127,6 +128,11 @@ DIC_BASE_AGENT_CONF = {
     "UCB_MIN": 0.0,
     "USE_HEAD_BOOTSTRAP": False,
     "HEAD_BOOTSTRAP_P": 0.8,
+    # REDQ-style target options
+    "USE_REDQ": False,
+    "REDQ_M": 2,
+    "REDQ_LAMBDA": 1.0,
+    "REDQ_UTD": 1,
     # CoS defaults
     "COS_ENABLED": False,
     "COS_TOTAL_K": 5,

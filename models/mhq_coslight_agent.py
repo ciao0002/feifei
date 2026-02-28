@@ -116,13 +116,35 @@ class CoSDynamicAdjacency(Layer):
     Build dynamic collaborator adjacency from CoS logits/probabilities.
     Output shape: [B, N, K, N], where K includes self when include_self=True.
     """
-    def __init__(self, num_agents, total_k, include_self=True, **kwargs):
+    def __init__(
+        self,
+        num_agents,
+        total_k,
+        include_self=True,
+        adj_mode="tiled_sparse",
+        slot_min_prob=0.0,
+        slot_budget_tau=0.05,
+        explore_mode="none",
+        explore_prob=0.0,
+        gumbel_tau=1.0,
+        gumbel_scale=1.0,
+        explore_infer=False,
+        **kwargs
+    ):
         super(CoSDynamicAdjacency, self).__init__(**kwargs)
         self.num_agents = int(num_agents)
         self.total_k = int(total_k)
         self.include_self = bool(include_self)
+        self.adj_mode = str(adj_mode or "tiled_sparse").lower()
+        self.slot_min_prob = float(slot_min_prob)
+        self.slot_budget_tau = float(slot_budget_tau)
+        self.explore_mode = str(explore_mode or "none").lower()
+        self.explore_prob = float(explore_prob)
+        self.gumbel_tau = float(gumbel_tau)
+        self.gumbel_scale = float(gumbel_scale)
+        self.explore_infer = bool(explore_infer)
 
-    def call(self, scores):
+    def call(self, scores, training=None):
         # scores: [B, N, N] (logits)
         probs = tf.nn.softmax(scores, axis=-1)
         dtype = probs.dtype
@@ -143,11 +165,55 @@ class CoSDynamicAdjacency(Layer):
             probs_others = probs
 
         if other_k > 0:
-            topk = tf.math.top_k(probs_others, k=other_k, sorted=False)
-            mask = tf.reduce_sum(tf.one_hot(topk.indices, depth=n, dtype=dtype), axis=2)  # [B,N,N]
-            sparse = probs_others * mask
-            sparse = sparse / (tf.reduce_sum(sparse, axis=-1, keepdims=True) + 1e-8)
-            other_rows = tf.tile(tf.expand_dims(sparse, axis=2), [1, 1, other_k, 1])  # [B,N,other_k,N]
+            # Deterministic: top-k on probabilities (current behavior).
+            det_topk = tf.math.top_k(probs_others, k=other_k, sorted=False)
+            indices = det_topk.indices
+
+            # Optional: stochastic, without-replacement sampling via Gumbel-TopK on log-probs.
+            # This matches CoSLight's intent (exploration in collaborator selection) while
+            # keeping a deterministic default (explore_prob=0).
+            can_sample = (
+                self.explore_mode in ("gumbel_topk", "gumbel", "sample", "sampling")
+                and (self.explore_prob > 0.0)
+            )
+            if can_sample:
+                eps = tf.constant(1e-20, dtype=dtype)
+                log_probs = tf.math.log(probs_others + eps)
+                u = tf.random.uniform(tf.shape(log_probs), minval=0.0, maxval=1.0, dtype=dtype)
+                g = -tf.math.log(-tf.math.log(u + eps) + eps)  # Gumbel(0,1)
+                tau = tf.constant(max(self.gumbel_tau, 1e-6), dtype=dtype)
+                noisy = (log_probs / tau) + (tf.constant(self.gumbel_scale, dtype=dtype) * g)
+                samp_topk = tf.math.top_k(noisy, k=other_k, sorted=False)
+
+                # Decide per (batch, agent-row) whether to sample.
+                # Default: only during training; can be forced during inference via explore_infer.
+                do_phase = (training is True) or self.explore_infer
+                if do_phase:
+                    row_u = tf.random.uniform([batch, n, 1], minval=0.0, maxval=1.0, dtype=dtype)
+                    use_sample = row_u < tf.constant(self.explore_prob, dtype=dtype)
+                    use_sample = tf.tile(use_sample, [1, 1, other_k])  # [B,N,K]
+                    indices = tf.where(use_sample, samp_topk.indices, indices)
+
+            if self.adj_mode in ("topk_slots", "slots", "topk"):
+                # Build K distinct neighbor slots: each slot is a (scaled) one-hot vector.
+                # This is more faithful to Top-K collaborator selection and enables
+                # adaptive effective-K by thresholding small probabilities.
+                topk_p = tf.gather(probs_others, indices, batch_dims=2)  # [B,N,K]
+
+                if self.slot_min_prob > 0.0:
+                    thr = tf.constant(self.slot_min_prob, dtype=dtype)
+                    tau = tf.constant(max(self.slot_budget_tau, 1e-6), dtype=dtype)
+                    keep = tf.sigmoid((topk_p - thr) / tau)  # [B,N,K]
+                    topk_p = topk_p * keep
+
+                onehots = tf.one_hot(indices, depth=n, dtype=dtype)  # [B,N,K,N]
+                other_rows = onehots * tf.expand_dims(topk_p, axis=-1)  # [B,N,K,N]
+            else:
+                # Legacy behavior: build a sparse distribution over selected set, then tile.
+                mask = tf.reduce_sum(tf.one_hot(indices, depth=n, dtype=dtype), axis=2)  # [B,N,N]
+                sparse = probs_others * mask
+                sparse = sparse / (tf.reduce_sum(sparse, axis=-1, keepdims=True) + 1e-8)
+                other_rows = tf.tile(tf.expand_dims(sparse, axis=2), [1, 1, other_k, 1])  # [B,N,other_k,N]
         else:
             other_rows = tf.zeros([batch, n, 0, n], dtype=dtype)
 
@@ -161,6 +227,14 @@ class CoSDynamicAdjacency(Layer):
             "num_agents": self.num_agents,
             "total_k": self.total_k,
             "include_self": self.include_self,
+            "adj_mode": self.adj_mode,
+            "slot_min_prob": self.slot_min_prob,
+            "slot_budget_tau": self.slot_budget_tau,
+            "explore_mode": self.explore_mode,
+            "explore_prob": self.explore_prob,
+            "gumbel_tau": self.gumbel_tau,
+            "gumbel_scale": self.gumbel_scale,
+            "explore_infer": self.explore_infer,
         }
         base = super(CoSDynamicAdjacency, self).get_config()
         return dict(list(base.items()) + list(config.items()))
@@ -179,6 +253,18 @@ class MHQCoSLightAgent(Agent):
         self.cos_beta_diag = float(dic_agent_conf.get("COS_BETA_DIAG", 0.0))
         self.cos_gamma_sym = float(dic_agent_conf.get("COS_GAMMA_SYM", 0.0))
         self.cos_entropy_coef = float(dic_agent_conf.get("COS_ENTROPY_COEF", 0.0))
+        self.cos_temporal_smooth_coef = float(dic_agent_conf.get("COS_TEMPORAL_SMOOTH_COEF", 0.0))
+        self.cos_budget_coef = float(dic_agent_conf.get("COS_BUDGET_COEF", 0.0))
+        self.cos_budget_thr = float(dic_agent_conf.get("COS_BUDGET_THR", 0.0))
+        self.cos_budget_tau = float(dic_agent_conf.get("COS_BUDGET_TAU", 0.05))
+        self.cos_adj_mode = str(dic_agent_conf.get("COS_ADJ_MODE", "tiled_sparse") or "tiled_sparse").lower()
+        self.cos_slot_min_prob = float(dic_agent_conf.get("COS_SLOT_MIN_PROB", 0.0))
+        # CoS collaborator selection exploration (default OFF).
+        self.cos_explore_mode = str(dic_agent_conf.get("COS_EXPLORE_MODE", "none") or "none").lower()
+        self.cos_explore_prob = float(dic_agent_conf.get("COS_EXPLORE_PROB", 0.0))
+        self.cos_gumbel_tau = float(dic_agent_conf.get("COS_GUMBEL_TAU", 1.0))
+        self.cos_gumbel_scale = float(dic_agent_conf.get("COS_GUMBEL_SCALE", 1.0))
+        self.cos_explore_infer = bool(dic_agent_conf.get("COS_EXPLORE_INFER", False))
         # Keep semantic consistency: K refers to collaborator count (including self by default).
         if self.cos_enabled:
             self.num_neighbors = min(self.cos_total_k, self.num_agents)
@@ -187,6 +273,16 @@ class MHQCoSLightAgent(Agent):
 
         self.num_actions = len(self.dic_traffic_env_conf["PHASE"])
         self.len_feature = self._cal_len_feature()
+        # Traffic State Augmentation (TSA): lightweight data augmentation on replayed states.
+        self.tsa_enabled = bool(dic_agent_conf.get("TSA_ENABLED", False))
+        self.tsa_gaussian_std = float(dic_agent_conf.get("TSA_GAUSSIAN_STD", 0.0))
+        self.tsa_mask_prob = float(dic_agent_conf.get("TSA_MASK_PROB", 0.0))
+        self.tsa_scale_low = float(dic_agent_conf.get("TSA_SCALE_LOW", 1.0))
+        self.tsa_scale_high = float(dic_agent_conf.get("TSA_SCALE_HIGH", 1.0))
+        self.tsa_apply_to_next_state = bool(dic_agent_conf.get("TSA_APPLY_TO_NEXT_STATE", True))
+        if self.tsa_scale_low > self.tsa_scale_high:
+            self.tsa_scale_low, self.tsa_scale_high = self.tsa_scale_high, self.tsa_scale_low
+        self.tsa_dim_mask = self._build_tsa_dim_mask().astype(np.float32)
         self.memory = build_memory()
 
         self.use_multihead = dic_agent_conf.get("USE_MULTIHEAD_Q", False)
@@ -202,8 +298,22 @@ class MHQCoSLightAgent(Agent):
         
         # Phase B: REDQ
         self.use_redq = dic_agent_conf.get("USE_REDQ", False)
-        self.redq_m = dic_agent_conf.get("REDQ_M", 2)
-        self.redq_lambda = dic_agent_conf.get("REDQ_LAMBDA", 1.0)
+        self.redq_m = int(dic_agent_conf.get("REDQ_M", 2))
+        self.redq_lambda = float(dic_agent_conf.get("REDQ_LAMBDA", 1.0))
+        self.redq_utd = max(1, int(dic_agent_conf.get("REDQ_UTD", 1)))
+        # True REDQ mode: use independent Q-ensemble (not shared-trunk multi-head).
+        self.true_redq_mode = bool(dic_agent_conf.get("TRUE_REDQ_MODE", False))
+        self.use_true_redq_ensemble = bool(self.use_redq and self.true_redq_mode)
+        self.redq_n = max(2, int(dic_agent_conf.get("REDQ_N", self.head_n)))
+        # RELight-style discrete ensemble action selection.
+        self.relight_action_vote = bool(dic_agent_conf.get("RELIGHT_ACTION_VOTE", False))
+        if self.use_true_redq_ensemble:
+            # In true REDQ mode, HEAD_N is interpreted as ensemble size N.
+            self.use_multihead = False
+            self.head_n = self.redq_n
+            self.redq_m = max(1, min(self.redq_m, self.redq_n))
+        else:
+            self.redq_m = max(1, min(self.redq_m, self.head_n))
 
         # CityLight-inspired: competitive neighbor aggregation
         self.use_competitive_agg = dic_agent_conf.get("USE_COMPETITIVE_AGG", False)
@@ -218,6 +328,15 @@ class MHQCoSLightAgent(Agent):
         self.trans_prenorm = bool(dic_agent_conf.get("TRANS_PRENORM", True))
         self.cos_prob_model = None
         
+        if self.use_true_redq_ensemble:
+            print(
+                "[True-REDQ] enabled, N={}, M={}, λ={}, UTD={} "
+                "(independent critics; no shared-trunk multi-head)".format(
+                    self.redq_n, self.redq_m, self.redq_lambda, self.redq_utd
+                )
+            )
+            if self.relight_action_vote:
+                print("[RELight] vote action enabled (majority vote across ensemble critics)")
         if self.use_multihead:
             print("[MultiHead] enabled, N={}, AGG={}".format(
                 self.head_n, self.head_agg))
@@ -229,8 +348,10 @@ class MHQCoSLightAgent(Agent):
             if self.use_head_bootstrap:
                 print("[MultiHead-Bootstrap] enabled, p={}".format(self.head_bootstrap_p))
             if self.use_redq:
-                print("[REDQ] enabled, M={}, λ={} (Q_mix = (1-λ)*mean + λ*min_sub)".format(
-                    self.redq_m, self.redq_lambda))
+                print("[REDQ] enabled, M={}, λ={}, UTD={} (Q_mix = (1-λ)*mean + λ*min_sub)".format(
+                    self.redq_m, self.redq_lambda, self.redq_utd))
+                if self.true_redq_mode:
+                    print("[REDQ] true_redq_mode=True (legacy multi-head action mixing path)")
         if self.use_competitive_agg:
             print("[CompetitiveAgg] enabled, splitting neighbors into 2 competing groups")
         if self.use_transformer_encoder:
@@ -246,6 +367,19 @@ class MHQCoSLightAgent(Agent):
                     self.trans_prenorm,
                 )
             )
+        if self.tsa_enabled:
+            active_ratio = float(np.mean(self.tsa_dim_mask)) if self.tsa_dim_mask.size > 0 else 0.0
+            print(
+                "[TSA] enabled, gaussian_std={}, mask_prob={}, scale_range=[{}, {}], "
+                "apply_to_next_state={}, active_dim_ratio={:.3f}".format(
+                    self.tsa_gaussian_std,
+                    self.tsa_mask_prob,
+                    self.tsa_scale_low,
+                    self.tsa_scale_high,
+                    self.tsa_apply_to_next_state,
+                    active_ratio,
+                )
+            )
         if self.cos_enabled:
             print("[CoS] enabled, K={}, include_self={}, beta_diag={}, gamma_sym={}, ent_coef={}".format(
                 self.num_neighbors,
@@ -254,38 +388,131 @@ class MHQCoSLightAgent(Agent):
                 self.cos_gamma_sym,
                 self.cos_entropy_coef,
             ))
+            if self.cos_explore_mode != "none" and self.cos_explore_prob > 0.0:
+                print(
+                    "[CoS-Explore] mode={}, prob={}, tau={}, scale={}, infer={}".format(
+                        self.cos_explore_mode,
+                        self.cos_explore_prob,
+                        self.cos_gumbel_tau,
+                        self.cos_gumbel_scale,
+                        self.cos_explore_infer,
+                    )
+                )
 
-        if cnt_round == 0:
-            # initialization
-            self.q_network = self.build_network()
-            self._refresh_cos_prob_model()
-            if os.listdir(self.dic_path["PATH_TO_MODEL"]):
-                self.q_network.load_weights(
-                    os.path.join(self.dic_path["PATH_TO_MODEL"], "round_0_inter_{0}.h5".format(intersection_id)),
-                    by_name=True)
-            self.q_network_bar = self.build_network_from_copy(self.q_network)
+        if self.use_true_redq_ensemble:
+            self._init_true_redq_ensemble(cnt_round, intersection_id)
         else:
-            try:
-                self.load_network("round_{0}_inter_{1}".format(cnt_round - 1, self.intersection_id))
-                if "UPDATE_Q_BAR_EVERY_C_ROUND" in self.dic_agent_conf:
-                    if self.dic_agent_conf["UPDATE_Q_BAR_EVERY_C_ROUND"]:
-                        self.load_network_bar("round_{0}_inter_{1}".format(
-                            max((cnt_round - 1) // self.dic_agent_conf["UPDATE_Q_BAR_FREQ"] * self.dic_agent_conf[
-                                "UPDATE_Q_BAR_FREQ"], 0),
-                            self.intersection_id))
+            if cnt_round == 0:
+                # initialization
+                self.q_network = self.build_network()
+                self._refresh_cos_prob_model()
+                if os.listdir(self.dic_path["PATH_TO_MODEL"]):
+                    self.q_network.load_weights(
+                        os.path.join(self.dic_path["PATH_TO_MODEL"], "round_0_inter_{0}.h5".format(intersection_id)),
+                        by_name=True)
+                self.q_network_bar = self.build_network_from_copy(self.q_network)
+            else:
+                try:
+                    self.load_network("round_{0}_inter_{1}".format(cnt_round - 1, self.intersection_id))
+                    if "UPDATE_Q_BAR_EVERY_C_ROUND" in self.dic_agent_conf:
+                        if self.dic_agent_conf["UPDATE_Q_BAR_EVERY_C_ROUND"]:
+                            self.load_network_bar("round_{0}_inter_{1}".format(
+                                max((cnt_round - 1) // self.dic_agent_conf["UPDATE_Q_BAR_FREQ"] * self.dic_agent_conf[
+                                    "UPDATE_Q_BAR_FREQ"], 0),
+                                self.intersection_id))
+                        else:
+                            self.load_network_bar("round_{0}_inter_{1}".format(
+                                max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0),
+                                self.intersection_id))
                     else:
                         self.load_network_bar("round_{0}_inter_{1}".format(
-                            max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0),
-                            self.intersection_id))
-                else:
-                    self.load_network_bar("round_{0}_inter_{1}".format(
-                        max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0), self.intersection_id))
-            except:
-                print("fail to load network, current round: {0}".format(cnt_round))
-            self._refresh_cos_prob_model()
+                            max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0), self.intersection_id))
+                except:
+                    print("fail to load network, current round: {0}".format(cnt_round))
+                self._refresh_cos_prob_model()
 
         decayed_epsilon = self.dic_agent_conf["EPSILON"] * pow(self.dic_agent_conf["EPSILON_DECAY"], cnt_round)
         self.dic_agent_conf["EPSILON"] = max(decayed_epsilon, self.dic_agent_conf["MIN_EPSILON"])
+
+    @staticmethod
+    def _custom_objects():
+        return {
+            "RepeatVector3D": RepeatVector3D,
+            "StackHeads": StackHeads,
+            "CoSDynamicAdjacency": CoSDynamicAdjacency,
+            "MatMulLayer": MatMulLayer,
+            "PermuteDimensionsLayer": PermuteDimensionsLayer,
+            "SoftmaxMatMulLayer": SoftmaxMatMulLayer,
+            "MeanMatMulLayer": MeanMatMulLayer,
+            "SliceLayer": SliceLayer,
+            "ZerosLayer": ZerosLayer
+        }
+
+    def _ensemble_file_name(self, file_name, q_idx):
+        return "{}_q{}".format(file_name, q_idx)
+
+    def _sample_redq_indices(self):
+        if self.redq_m >= self.redq_n:
+            return np.arange(self.redq_n, dtype=np.int32)
+        return np.random.choice(self.redq_n, self.redq_m, replace=False)
+
+    def _soft_update_true_redq_targets(self):
+        """
+        Paper-style Polyak soft update for true-REDQ ensemble:
+        target <- (1 - tau) * target + tau * online
+        """
+        if (not self.use_true_redq_ensemble) or (not bool(self.dic_agent_conf.get("REDQ_SOFT_TARGET_UPDATE", False))):
+            return
+        tau = float(self.dic_agent_conf.get("REDQ_TAU", 0.005))
+        tau = float(np.clip(tau, 0.0, 1.0))
+        if tau <= 0.0:
+            return
+        for online_net, target_net in zip(self.q_ensemble, self.q_ensemble_bar):
+            online_weights = online_net.get_weights()
+            target_weights = target_net.get_weights()
+            blended = [
+                (1.0 - tau) * target_w + tau * online_w
+                for online_w, target_w in zip(online_weights, target_weights)
+            ]
+            target_net.set_weights(blended)
+        self.q_network_bar = self.q_ensemble_bar[0]
+
+    def _init_true_redq_ensemble(self, cnt_round, intersection_id):
+        self.q_ensemble = []
+        self.q_ensemble_bar = []
+        use_soft_target = bool(self.dic_agent_conf.get("REDQ_SOFT_TARGET_UPDATE", False))
+        if cnt_round == 0:
+            # Fresh start: independent critics with independent initialization.
+            self.q_ensemble = [self.build_network() for _ in range(self.redq_n)]
+            self.q_ensemble_bar = [self.build_network_from_copy(net) for net in self.q_ensemble]
+        else:
+            try:
+                self.load_network("round_{0}_inter_{1}".format(cnt_round - 1, self.intersection_id))
+                if use_soft_target:
+                    # Paper-style target update path starts each round from online copy,
+                    # then uses in-round Polyak updates after each optimization step.
+                    self.q_ensemble_bar = [self.build_network_from_copy(net) for net in self.q_ensemble]
+                else:
+                    if "UPDATE_Q_BAR_EVERY_C_ROUND" in self.dic_agent_conf:
+                        if self.dic_agent_conf["UPDATE_Q_BAR_EVERY_C_ROUND"]:
+                            bar_round = max(
+                                (cnt_round - 1) // self.dic_agent_conf["UPDATE_Q_BAR_FREQ"]
+                                * self.dic_agent_conf["UPDATE_Q_BAR_FREQ"],
+                                0,
+                            )
+                        else:
+                            bar_round = max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0)
+                    else:
+                        bar_round = max(cnt_round - self.dic_agent_conf["UPDATE_Q_BAR_FREQ"], 0)
+                    self.load_network_bar("round_{0}_inter_{1}".format(bar_round, self.intersection_id))
+            except Exception:
+                print("fail to load true REDQ ensemble, current round: {0}".format(cnt_round))
+                self.q_ensemble = [self.build_network() for _ in range(self.redq_n)]
+                self.q_ensemble_bar = [self.build_network_from_copy(net) for net in self.q_ensemble]
+
+        self.q_network = self.q_ensemble[0]
+        self.q_network_bar = self.q_ensemble_bar[0]
+        self._refresh_cos_prob_model()
 
     def _cal_len_feature(self):
         N = 0
@@ -293,9 +520,66 @@ class MHQCoSLightAgent(Agent):
         for feat_name in used_feature:
             if "cur_phase" in feat_name:
                 N += 8
+            elif feat_name in ("phase_elapsed", "time_this_phase", "downstream_congestion"):
+                N += 1
             else:
                 N += 12
         return N
+
+    @staticmethod
+    def _feature_dim_from_name(feat_name):
+        if "cur_phase" in feat_name:
+            return 8
+        if feat_name in ("phase_elapsed", "time_this_phase", "downstream_congestion"):
+            return 1
+        return 12
+
+    def _build_tsa_dim_mask(self):
+        """
+        Build [1,1,D] augmentation mask.
+        By default, do NOT perturb discrete phase encoding dimensions.
+        """
+        used_feature = self.dic_traffic_env_conf["LIST_STATE_FEATURE"][:-1]
+        mask = np.zeros((self.len_feature,), dtype=np.float32)
+        cursor = 0
+        for feat_name in used_feature:
+            dim = self._feature_dim_from_name(feat_name)
+            use_aug = ("cur_phase" not in feat_name)
+            end = min(cursor + dim, self.len_feature)
+            if use_aug and end > cursor:
+                mask[cursor:end] = 1.0
+            cursor += dim
+            if cursor >= self.len_feature:
+                break
+        return mask.reshape(1, 1, -1)
+
+    def _augment_states_tsa(self, states):
+        """
+        Apply TSA on replayed states before Q-target/loss computation.
+        states: [B, Agents, D]
+        """
+        if (not self.tsa_enabled) or states is None or len(states) == 0:
+            return states
+        x = np.array(states, dtype=np.float32, copy=True)
+        dim_mask = self.tsa_dim_mask
+        if dim_mask.shape[-1] != x.shape[-1]:
+            # Safety fallback for unexpected feature mismatch.
+            dim_mask = np.ones((1, 1, x.shape[-1]), dtype=np.float32)
+
+        if self.tsa_gaussian_std > 0:
+            noise = np.random.normal(0.0, self.tsa_gaussian_std, size=x.shape).astype(np.float32)
+            x = x + noise * dim_mask
+
+        if self.tsa_mask_prob > 0:
+            drop = (np.random.rand(*x.shape) < self.tsa_mask_prob).astype(np.float32)
+            x = x * (1.0 - drop * dim_mask)
+
+        if (self.tsa_scale_low != 1.0) or (self.tsa_scale_high != 1.0):
+            scale = np.random.uniform(
+                self.tsa_scale_low, self.tsa_scale_high, size=(x.shape[0], x.shape[1], 1)
+            ).astype(np.float32)
+            x = x + (x * (scale - 1.0)) * dim_mask
+        return x
 
     @staticmethod
     def MLP(ins, layers=None):
@@ -532,7 +816,16 @@ class MHQCoSLightAgent(Agent):
             for feature in used_feature:
                 if feature == "cur_phase":
                     if self.dic_traffic_env_conf["BINARY_PHASE_EXPANSION"]:
-                        tmp.extend(self.dic_traffic_env_conf['PHASE'][s[i][feature][0]])
+                        # Resume loads traffic_env.conf from JSON, where dict keys become strings.
+                        # Support both int and str phase keys to avoid KeyError during resumed runs.
+                        phase_cfg = self.dic_traffic_env_conf['PHASE']
+                        phase_id = s[i][feature][0]
+                        phase_vec = phase_cfg.get(phase_id)
+                        if phase_vec is None:
+                            phase_vec = phase_cfg.get(str(phase_id))
+                        if phase_vec is None:
+                            raise KeyError("Unknown phase id {} in PHASE config".format(phase_id))
+                        tmp.extend(phase_vec)
                     else:
                         tmp.extend(s[i][feature])
                 else:
@@ -591,6 +884,33 @@ class MHQCoSLightAgent(Agent):
         -output: act: [#agents,num_actions]
         """
         xs = self.convert_state_to_input(states)
+        if self.use_true_redq_ensemble:
+            q_values = [np.array(net(xs)[0], dtype=np.float32) for net in self.q_ensemble]  # list of [Agents, A]
+            q_stack = np.stack(q_values, axis=0)  # [N, Agents, A]
+            if random.random() <= self.dic_agent_conf["EPSILON"]:
+                return np.random.randint(self.num_actions, size=q_stack.shape[1])
+            if self.relight_action_vote:
+                # RELight-style acting: each critic votes an argmax action.
+                q_mean = np.mean(q_stack, axis=0)  # [Agents, A], used for tie break.
+                votes = np.argmax(q_stack, axis=2)  # [N, Agents]
+                actions = np.zeros((q_stack.shape[1],), dtype=np.int32)
+                for ag in range(q_stack.shape[1]):
+                    counts = np.bincount(votes[:, ag], minlength=self.num_actions)
+                    max_cnt = np.max(counts)
+                    cand = np.where(counts == max_cnt)[0]
+                    if cand.size == 1:
+                        actions[ag] = int(cand[0])
+                    else:
+                        # Deterministic tie-break by mean Q on candidate actions.
+                        cand_q = q_mean[ag, cand]
+                        actions[ag] = int(cand[np.argmax(cand_q)])
+                return actions
+            q_mean = np.mean(q_stack, axis=0)  # [Agents, A]
+            sampled = self._sample_redq_indices()
+            q_min = np.min(q_stack[sampled], axis=0)  # [Agents, A]
+            q_policy = (1.0 - self.redq_lambda) * q_mean + self.redq_lambda * q_min
+            return np.argmax(q_policy, axis=1)
+
         q_values = self.q_network(xs)
         if self.cos_enabled and self.cos_prob_model is not None and self.head_debug and count % 50 == 0:
             probs = np.array(self.cos_prob_model.predict(xs, verbose=0))
@@ -601,6 +921,18 @@ class MHQCoSLightAgent(Agent):
             q_heads = np.array(q_values[0], dtype=np.float32)  # [Agents, N, A]
             q_mean = np.mean(q_heads, axis=1)  # [Agents, A]
             q_policy = q_mean
+            if self.use_redq and self.true_redq_mode:
+                # True REDQ action selection: use REDQ-style Q_mix, not plain head mean.
+                m = max(1, min(self.redq_m, self.head_n))
+                q_policy = np.zeros_like(q_mean, dtype=np.float32)
+                for a in range(q_heads.shape[0]):
+                    if m >= self.head_n:
+                        sampled_q = q_heads[a]  # [N, A]
+                    else:
+                        sampled_heads = np.random.choice(self.head_n, m, replace=False)
+                        sampled_q = q_heads[a, sampled_heads, :]  # [M, A]
+                    q_min = np.min(sampled_q, axis=0)  # [A]
+                    q_policy[a] = (1.0 - self.redq_lambda) * q_mean[a] + self.redq_lambda * q_min
             if self.use_ucb_action:
                 q_std = np.std(q_heads, axis=1)  # [Agents, A]
                 ucb_coef = max(self.ucb_min, self.ucb_lambda * pow(self.ucb_decay, count))
@@ -659,10 +991,48 @@ class MHQCoSLightAgent(Agent):
         _adjs2 = self.adjacency_index2matrix(np.array(_adjs))
 
         # [batch, 1, dim] -> [batch, agent, dim]
-        _state2 = np.concatenate([np.array(ss) for ss in _state], axis=1)
-        _next_state2 = np.concatenate([np.array(ss) for ss in _next_state], axis=1)
-        target = self.q_network([_state2, _adjs2])
-        next_state_qvalues = self.q_network_bar([_next_state2, _adjs2])
+        _state2 = np.concatenate([np.array(ss) for ss in _state], axis=1).astype(np.float32)
+        _next_state2 = np.concatenate([np.array(ss) for ss in _next_state], axis=1).astype(np.float32)
+        _state2_train = self._augment_states_tsa(_state2)
+        if self.tsa_apply_to_next_state:
+            _next_state2_train = self._augment_states_tsa(_next_state2)
+        else:
+            _next_state2_train = _next_state2
+        if self.use_true_redq_ensemble:
+            # True REDQ: independent critic ensemble.
+            target_list = [
+                np.array(net([_state2_train, _adjs2]), dtype=np.float32)
+                for net in self.q_ensemble
+            ]  # N x [B, Agents, A]
+            next_q_list = [
+                np.array(net_bar([_next_state2_train, _adjs2]), dtype=np.float32)
+                for net_bar in self.q_ensemble_bar
+            ]  # N x [B, Agents, A]
+
+            final_targets = [np.copy(t) for t in target_list]
+            lam = self.redq_lambda
+            for i in range(slice_size):
+                for j in range(self.num_agents):
+                    sampled = self._sample_redq_indices()
+                    q_subset = np.stack([next_q_list[k][i, j, :] for k in sampled], axis=0)  # [M, A]
+                    q_min = np.min(q_subset, axis=0)  # [A]
+                    q_all = np.stack([next_q_list[k][i, j, :] for k in range(self.redq_n)], axis=0)  # [N, A]
+                    q_mean = np.mean(q_all, axis=0)  # [A]
+                    q_mix = (1.0 - lam) * q_mean + lam * q_min
+                    y = _reward[j][i] / self.dic_agent_conf["NORMAL_FACTOR"] + \
+                        self.dic_agent_conf["GAMMA"] * np.max(q_mix)
+                    action = _action[j][i]
+                    for k in range(self.redq_n):
+                        final_targets[k][i, j, action] = y
+
+            self.Xs = [_state2_train, _adjs2]
+            self.Y_ensemble = final_targets
+            # Keep Y for compatibility with existing logging/guards.
+            self.Y = final_targets[0]
+            return
+
+        target = self.q_network([_state2_train, _adjs2])
+        next_state_qvalues = self.q_network_bar([_next_state2_train, _adjs2])
 
         if self.use_multihead:
             # target: [B, Agents, N, A], next_state_qvalues: [B, Agents, N, A]
@@ -705,7 +1075,7 @@ class MHQCoSLightAgent(Agent):
                     final_target[i, j, _action[j][i]] = _reward[j][i] / self.dic_agent_conf["NORMAL_FACTOR"] + \
                                                         self.dic_agent_conf["GAMMA"] * np.max(next_state_qvalues[i, j])
 
-        self.Xs = [_state2, _adjs2]
+        self.Xs = [_state2_train, _adjs2]
         self.Y = final_target
 
     def _assign_multihead_target(self, final_target, b, ag, action, y):
@@ -758,6 +1128,14 @@ class MHQCoSLightAgent(Agent):
                 num_agents=self.num_agents,
                 total_k=self.num_neighbors,
                 include_self=self.cos_include_self,
+                adj_mode=self.cos_adj_mode,
+                slot_min_prob=self.cos_slot_min_prob,
+                slot_budget_tau=self.cos_budget_tau,
+                explore_mode=self.cos_explore_mode,
+                explore_prob=self.cos_explore_prob,
+                gumbel_tau=self.cos_gumbel_tau,
+                gumbel_scale=self.cos_gumbel_scale,
+                explore_infer=self.cos_explore_infer,
                 name="cos_dynamic_adj"
             )(cos_logits)
         if self.use_transformer_encoder:
@@ -822,15 +1200,49 @@ class MHQCoSLightAgent(Agent):
             diag_loss = -tf.reduce_mean(diag)
             sym_loss = tf.reduce_mean(tf.square(cos_probs - tf.transpose(cos_probs, perm=[0, 2, 1])))
             entropy = -tf.reduce_mean(tf.reduce_sum(cos_probs * tf.math.log(cos_probs + 1e-8), axis=-1))
+
+            # Temporal smoothness proxy: penalize changes between consecutive items in the batch.
+            # NOTE: This assumes batches preserve temporal order (we already fit(shuffle=False)).
+            temporal_loss = tf.constant(0.0, dtype=cos_probs.dtype)
+            if self.cos_temporal_smooth_coef > 0:
+                diff = cos_probs[1:] - cos_probs[:-1]
+                sq = tf.square(diff)
+                # Use reduce_mean instead of tf.size-based normalization.
+                # tf.size can become fragile after model JSON round-trips in TF/Keras.
+                temporal_loss = tf.reduce_mean(sq)
+
+            # Budget / adaptive-K proxy: encourage sparsity by penalizing the expected number
+            # of edges whose probability exceeds a threshold (smooth indicator).
+            budget_loss = tf.constant(0.0, dtype=cos_probs.dtype)
+            budget_k_mean = tf.constant(0.0, dtype=cos_probs.dtype)
+            if self.cos_budget_coef > 0 and self.cos_budget_thr > 0:
+                n = self.num_agents
+                eye = tf.eye(n, dtype=cos_probs.dtype)
+                eye_b = tf.tile(tf.reshape(eye, [1, n, n]), [tf.shape(cos_probs)[0], 1, 1])
+                thr = tf.constant(self.cos_budget_thr, dtype=cos_probs.dtype)
+                tau = tf.constant(max(self.cos_budget_tau, 1e-6), dtype=cos_probs.dtype)
+                active = tf.sigmoid((cos_probs - thr) / tau) * (1.0 - eye_b)
+                budget_k = tf.reduce_sum(active, axis=-1)  # [B,N]
+                budget_k_mean = tf.reduce_mean(budget_k)
+                budget_loss = budget_k_mean
+
             if self.cos_beta_diag > 0:
                 model.add_loss(self.cos_beta_diag * diag_loss)
             if self.cos_gamma_sym > 0:
                 model.add_loss(self.cos_gamma_sym * sym_loss)
             if self.cos_entropy_coef > 0:
                 model.add_loss(-self.cos_entropy_coef * entropy)
+            if self.cos_temporal_smooth_coef > 0:
+                model.add_loss(self.cos_temporal_smooth_coef * temporal_loss)
+            if self.cos_budget_coef > 0 and self.cos_budget_thr > 0:
+                model.add_loss(self.cos_budget_coef * budget_loss)
             model.add_metric(diag_loss, name="cos_diag_loss", aggregation="mean")
             model.add_metric(sym_loss, name="cos_sym_loss", aggregation="mean")
             model.add_metric(entropy, name="cos_entropy", aggregation="mean")
+            if self.cos_temporal_smooth_coef > 0:
+                model.add_metric(temporal_loss, name="cos_temporal_smooth", aggregation="mean")
+            if self.cos_budget_coef > 0 and self.cos_budget_thr > 0:
+                model.add_metric(budget_k_mean, name="cos_budget_k_mean", aggregation="mean")
 
         model.compile(optimizer=Adam(lr=self.dic_agent_conf.get("LEARNING_RATE", 0.0005)),
                       loss=self.dic_agent_conf["LOSS_FUNCTION"])
@@ -838,6 +1250,35 @@ class MHQCoSLightAgent(Agent):
         return model
 
     def train_network(self):
+        if self.use_true_redq_ensemble:
+            if (not hasattr(self, "Y_ensemble")) or self.Y_ensemble is None or len(self.Y_ensemble) == 0:
+                return
+            epochs = self.dic_agent_conf["EPOCHS"]
+            batch_size = min(self.dic_agent_conf["BATCH_SIZE"], len(self.Y_ensemble[0]))
+            for q_idx, net in enumerate(self.q_ensemble):
+                # IMPORTANT: each critic trains on its own bootstrap batch so that
+                # ensemble members do not collapse to near-identical models.
+                sample_n = len(self.Y_ensemble[q_idx])
+                bootstrap_idx = np.random.randint(0, sample_n, size=sample_n)
+                Xs_q = [x[bootstrap_idx] for x in self.Xs]
+                Y_q = self.Y_ensemble[q_idx][bootstrap_idx]
+                early_stopping = EarlyStopping(
+                    monitor='val_loss', patience=self.dic_agent_conf["PATIENCE"], verbose=0, mode='min')
+                net.fit(
+                    Xs_q,
+                    Y_q,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    shuffle=False,
+                    verbose=(2 if q_idx == 0 else 0),
+                    validation_split=0.3,
+                    callbacks=[early_stopping],
+                )
+            self._soft_update_true_redq_targets()
+            self.q_network = self.q_ensemble[0]
+            self._refresh_cos_prob_model()
+            return
+
         if not hasattr(self, "Y") or self.Y is None or len(self.Y) == 0:
             return
         epochs = self.dic_agent_conf["EPOCHS"]
@@ -852,17 +1293,7 @@ class MHQCoSLightAgent(Agent):
         """Initialize a Q network from a copy"""
         network_structure = network_copy.to_json()
         network_weights = network_copy.get_weights()
-        custom_objs = {
-            "RepeatVector3D": RepeatVector3D,
-            "StackHeads": StackHeads,
-            "CoSDynamicAdjacency": CoSDynamicAdjacency,
-            "MatMulLayer": MatMulLayer,
-            "PermuteDimensionsLayer": PermuteDimensionsLayer,
-            "SoftmaxMatMulLayer": SoftmaxMatMulLayer,
-            "MeanMatMulLayer": MeanMatMulLayer,
-            "SliceLayer": SliceLayer,
-            "ZerosLayer": ZerosLayer
-        }
+        custom_objs = self._custom_objects()
         network = model_from_json(network_structure,
                                   custom_objects=custom_objs)
         network.set_weights(network_weights)
@@ -875,46 +1306,64 @@ class MHQCoSLightAgent(Agent):
         if file_path is None:
             file_path = self.dic_path["PATH_TO_MODEL"]
 
-        custom_objs = {
-            "RepeatVector3D": RepeatVector3D,
-            "StackHeads": StackHeads,
-            "CoSDynamicAdjacency": CoSDynamicAdjacency,
-            "MatMulLayer": MatMulLayer,
-            "PermuteDimensionsLayer": PermuteDimensionsLayer,
-            "SoftmaxMatMulLayer": SoftmaxMatMulLayer,
-            "MeanMatMulLayer": MeanMatMulLayer,
-            "SliceLayer": SliceLayer,
-            "ZerosLayer": ZerosLayer
-        }
-        self.q_network = load_model(
-            os.path.join(file_path, "%s.h5" % file_name),
-            custom_objects=custom_objs)
+        custom_objs = self._custom_objects()
+        if self.use_true_redq_ensemble:
+            self.q_ensemble = []
+            for q_idx in range(self.redq_n):
+                path = os.path.join(
+                    file_path,
+                    "{}.h5".format(self._ensemble_file_name(file_name, q_idx)),
+                )
+                self.q_ensemble.append(load_model(path, custom_objects=custom_objs))
+            self.q_network = self.q_ensemble[0]
+        else:
+            self.q_network = load_model(
+                os.path.join(file_path, "%s.h5" % file_name),
+                custom_objects=custom_objs)
         self._refresh_cos_prob_model()
         print("succeed in loading model %s" % file_name)
 
     def load_network_bar(self, file_name, file_path=None):
         if file_path is None:
             file_path = self.dic_path["PATH_TO_MODEL"]
-        custom_objs = {
-            "RepeatVector3D": RepeatVector3D,
-            "StackHeads": StackHeads,
-            "CoSDynamicAdjacency": CoSDynamicAdjacency,
-            "MatMulLayer": MatMulLayer,
-            "PermuteDimensionsLayer": PermuteDimensionsLayer,
-            "SoftmaxMatMulLayer": SoftmaxMatMulLayer,
-            "MeanMatMulLayer": MeanMatMulLayer,
-            "SliceLayer": SliceLayer,
-            "ZerosLayer": ZerosLayer
-        }
-        self.q_network_bar = load_model(
-            os.path.join(file_path, "%s.h5" % file_name),
-            custom_objects=custom_objs)
+        custom_objs = self._custom_objects()
+        if self.use_true_redq_ensemble:
+            self.q_ensemble_bar = []
+            for q_idx in range(self.redq_n):
+                path = os.path.join(
+                    file_path,
+                    "{}.h5".format(self._ensemble_file_name(file_name, q_idx)),
+                )
+                self.q_ensemble_bar.append(load_model(path, custom_objects=custom_objs))
+            self.q_network_bar = self.q_ensemble_bar[0]
+        else:
+            self.q_network_bar = load_model(
+                os.path.join(file_path, "%s.h5" % file_name),
+                custom_objects=custom_objs)
         print("succeed in loading model %s" % file_name)
 
     def save_network(self, file_name):
+        if self.use_true_redq_ensemble:
+            for q_idx, net in enumerate(self.q_ensemble):
+                net.save(
+                    os.path.join(
+                        self.dic_path["PATH_TO_MODEL"],
+                        "{}.h5".format(self._ensemble_file_name(file_name, q_idx)),
+                    )
+                )
+            return
         self.q_network.save(os.path.join(self.dic_path["PATH_TO_MODEL"], "%s.h5" % file_name))
 
     def save_network_bar(self, file_name):
+        if self.use_true_redq_ensemble:
+            for q_idx, net in enumerate(self.q_ensemble_bar):
+                net.save(
+                    os.path.join(
+                        self.dic_path["PATH_TO_MODEL"],
+                        "{}.h5".format(self._ensemble_file_name(file_name, q_idx)),
+                    )
+                )
+            return
         self.q_network_bar.save(os.path.join(self.dic_path["PATH_TO_MODEL"], "%s.h5" % file_name))
 
 

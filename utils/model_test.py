@@ -1,6 +1,6 @@
 from .config import DIC_AGENTS
 from copy import deepcopy
-from .cityflow_env import CityFlowEnv
+from .env_factory import get_env_class
 import json
 import os
 
@@ -39,7 +39,8 @@ def test(model_dir, cnt_round, run_cnt, _dic_traffic_env_conf):
         path_to_log = os.path.join(dic_path["PATH_TO_WORK_DIRECTORY"], "test_round", model_round)
         if not os.path.exists(path_to_log):
             os.makedirs(path_to_log)
-        env = CityFlowEnv(
+        env_class = get_env_class(dic_traffic_env_conf)
+        env = env_class(
             path_to_log=path_to_log,
             path_to_work_directory=dic_path["PATH_TO_WORK_DIRECTORY"],
             dic_traffic_env_conf=dic_traffic_env_conf

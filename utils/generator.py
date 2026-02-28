@@ -1,5 +1,5 @@
 from .config import DIC_AGENTS
-from .cityflow_env import CityFlowEnv
+from .env_factory import get_env_class
 import time
 import os
 import copy
@@ -37,7 +37,8 @@ class Generator:
             self.agents[i] = agent
         print("Create intersection agent time: ", time.time()-start_time)
 
-        self.env = CityFlowEnv(
+        env_class = get_env_class(self.dic_traffic_env_conf)
+        self.env = env_class(
             path_to_log=self.path_to_log,
             path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
             dic_traffic_env_conf=self.dic_traffic_env_conf
