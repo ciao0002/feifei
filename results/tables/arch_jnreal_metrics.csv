@@ -1,0 +1,4 @@
+series,rounds,tail10_duration,tail10_std,last_duration,best_att,best_round
+REDQ-Trans top5,60,245.01,0.68,244.78,244.000159,58
+GAT Ablation (StaticDelay 1x),60,245.59,0.62,245.68,244.793328,55
+RelMsg,60,245.22,0.87,246.07,243.232724,52

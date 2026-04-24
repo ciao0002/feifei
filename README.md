@@ -2,6 +2,9 @@
 
 This folder is a review-ready copy of the current method code path used in our experiments.
 
+Experiment summary:
+- See [RESULTS.md](./RESULTS.md) for representative figures, key metrics, and ablation/sensitivity results.
+
 Scope:
 - Current method only: `REDQ` with `ablation_mode=mlp_only`
 - Static collaborator selection from cached delay graph
